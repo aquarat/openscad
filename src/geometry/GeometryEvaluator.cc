@@ -14,8 +14,11 @@
 #include "core/ColorNode.h"
 #include "core/CsgOpNode.h"
 #include "core/CurveDiscretizer.h"
+#include "core/CutNode.h"
+#include "core/ExportObjectNode.h"
 #include "core/LinearExtrudeNode.h"
 #include "core/ModuleInstantiation.h"
+#include "core/Offset3dNode.h"
 #include "core/OffsetNode.h"
 #include "core/ProjectionNode.h"
 #include "core/RenderNode.h"
@@ -624,6 +627,102 @@ Response GeometryEvaluator::visit(State& state, const OffsetNode& node)
       }
     } else {
       geom = smartCacheGet(node, false);
+    }
+    addToParent(state, node, geom);
+    node.progress_report();
+  }
+  return Response::ContinueTraversal;
+}
+
+/*!
+   input: List of 3D objects
+   output: 3D Geometry
+   operation:
+    o Union all children into a single 3D geometry
+    o Clip the result by a half-space (plane) using the Manifold backend
+ */
+Response GeometryEvaluator::visit(State& state, const CutNode& node)
+{
+  if (state.isPrefix() && isSmartCached(node)) return Response::PruneTraversal;
+  if (state.isPostfix()) {
+    std::shared_ptr<const Geometry> geom;
+    if (!isSmartCached(node)) {
+      auto unioned = applyToChildren(node, OpenSCADOperator::UNION).constptr();
+#ifdef ENABLE_MANIFOLD
+      geom = ManifoldUtils::trimByPlane(unioned, node.plane);
+#else
+      LOG(message_group::Warning,
+          "cut() (section-cut) requires the Manifold backend; passing geometry through uncut.");
+      geom = unioned;
+#endif
+    } else {
+      geom = smartCacheGet(node, state.preferNef());
+    }
+    addToParent(state, node, geom);
+    node.progress_report();
+  }
+  return Response::ContinueTraversal;
+}
+
+/*!
+   3D surface offset (offset3d) and constant-thickness hollowing (shell).
+   Both union their children first, then apply a Minkowski-with-sphere based
+   operation via the Manifold backend.
+ */
+Response GeometryEvaluator::visit(State& state, const Offset3dNode& node)
+{
+  if (state.isPrefix() && isSmartCached(node)) return Response::PruneTraversal;
+  if (state.isPostfix()) {
+    std::shared_ptr<const Geometry> geom;
+    if (!isSmartCached(node)) {
+      auto unioned = applyToChildren(node, OpenSCADOperator::UNION).constptr();
+#ifdef ENABLE_MANIFOLD
+      const int segments = node.discretizer.getCircularSegmentCount(std::abs(node.delta)).value_or(0);
+      if (node.mode == Offset3dNode::SHELL) {
+        geom = ManifoldUtils::shell3D(unioned, node.delta, segments);
+      } else {
+        geom = ManifoldUtils::offset3D(unioned, node.delta, segments);
+      }
+#else
+      LOG(message_group::Warning,
+          "offset3d()/shell() require the Manifold backend; passing geometry through unchanged.");
+      geom = unioned;
+#endif
+    } else {
+      geom = smartCacheGet(node, state.preferNef());
+    }
+    addToParent(state, node, geom);
+    node.progress_report();
+  }
+  return Response::ContinueTraversal;
+}
+
+/*!
+   export_object() is a transparent passthrough: it unions its children and
+   stamps export metadata (name/material/color) onto the resulting geometry so
+   the 3MF exporter can emit it as a named object carrying that material. The
+   metadata lives on the Geometry base and survives the Manifold->PolySet
+   conversion used by the 3MF export path (see ManifoldGeometry::toPolySet()).
+ */
+Response GeometryEvaluator::visit(State& state, const ExportObjectNode& node)
+{
+  if (state.isPrefix() && isSmartCached(node)) return Response::PruneTraversal;
+  if (state.isPostfix()) {
+    std::shared_ptr<const Geometry> geom;
+    if (!isSmartCached(node)) {
+      // First union all children, then stamp metadata onto a mutable copy.
+      ResultObject res = applyToChildren(node, OpenSCADOperator::UNION);
+      if (res.constptr()) {
+        auto mutableGeom = res.asMutableGeometry();
+        if (mutableGeom) {
+          mutableGeom->objectName = node.objectName;
+          mutableGeom->objectMaterial = node.material;
+          if (node.color) mutableGeom->setColor(*node.color);
+        }
+        geom = mutableGeom;
+      }
+    } else {
+      geom = smartCacheGet(node, state.preferNef());
     }
     addToParent(state, node, geom);
     node.progress_report();

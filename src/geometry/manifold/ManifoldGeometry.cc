@@ -135,6 +135,10 @@ std::shared_ptr<PolySet> ManifoldGeometry::toPolySet() const
   ps->indices.reserve(mesh.NumTri());
   ps->setConvexity(convexity);
   ps->setManifold(true);
+  // Propagate export_object() metadata across the Manifold->PolySet conversion
+  // so the 3MF exporter (which converts via toPolySet()) can still read it.
+  ps->objectName = objectName;
+  ps->objectMaterial = objectMaterial;
 
   // first 3 channels are xyz coordinate
   for (size_t i = 0; i < mesh.vertProperties.size(); i += mesh.numProp)

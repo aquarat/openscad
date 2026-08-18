@@ -267,6 +267,12 @@ if(EXAMPLES_DIR)
 endif(EXAMPLES_DIR)
 
 file(GLOB FEATURES_3D_FILES   ${TEST_SCAD_DIR}/3D/features/*.scad)
+list(REMOVE_ITEM FEATURES_3D_FILES
+  ${TEST_SCAD_DIR}/3D/features/linear_extrude-chamfer-tests.scad # -> EXPERIMENTAL_LINEAR_EXTRUDE_CHAMFER_FILES
+  ${TEST_SCAD_DIR}/3D/features/cut-tests.scad                    # -> EXPERIMENTAL_SECTION_CUT_FILES
+  ${TEST_SCAD_DIR}/3D/features/offset3d-tests.scad               # -> EXPERIMENTAL_SHELL_FILES
+  ${TEST_SCAD_DIR}/3D/features/export_object-tests.scad          # experimental export-object; export regression wiring deferred
+)
 file(GLOB DEPRECATED_3D_FILES ${TEST_SCAD_DIR}/3D/deprecated/*.scad)
 file(GLOB ISSUES_3D_FILES     ${TEST_SCAD_DIR}/3D/issues/*.scad)
 file(GLOB SCAD_AMF_FILES           ${TEST_SCAD_DIR}/amf/*.scad)
@@ -1264,6 +1270,42 @@ add_cmdline_test(render-csg-cgal      EXPERIMENTAL SCRIPT ${EXPORT_IMPORT_PNGTES
 add_cmdline_test(render-cgal    EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_TEXTMETRICS_FILES} EXPECTEDDIR render ARGS --render --enable=textmetrics --backend=cgal)
 add_cmdline_test(render-dxf      EXPERIMENTAL SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png ARGS ${OPENSCAD_EXE_ARG} --format=DXF --render=force --enable=textmetrics EXPECTEDDIR render FILES ${EXPERIMENTAL_TEXTMETRICS_FILES})
 add_cmdline_test(render-svg      EXPERIMENTAL SCRIPT ${EXPORT_IMPORT_PNGTEST_PY} SUFFIX png ARGS ${OPENSCAD_EXE_ARG} --format=SVG --render=force --enable=textmetrics EXPECTEDDIR render FILES ${EXPERIMENTAL_TEXTMETRICS_FILES})
+
+#
+# --enable=geometry-metrics tests
+#
+list(APPEND EXPERIMENTAL_GEOMETRY_METRICS_ECHO_FILES
+  ${TEST_SCAD_DIR}/misc/geometry-metrics-test.scad
+)
+add_cmdline_test(echo           EXPERIMENTAL OPENSCAD SUFFIX echo FILES ${EXPERIMENTAL_GEOMETRY_METRICS_ECHO_FILES} ARGS --enable=geometry-metrics)
+
+#
+# --enable=linear-extrude-chamfer tests
+#
+list(APPEND EXPERIMENTAL_LINEAR_EXTRUDE_CHAMFER_FILES
+  ${TEST_SCAD_DIR}/3D/features/linear_extrude-chamfer-tests.scad
+)
+add_cmdline_test(dump           EXPERIMENTAL OPENSCAD SUFFIX csg FILES ${EXPERIMENTAL_LINEAR_EXTRUDE_CHAMFER_FILES} ARGS --enable=linear-extrude-chamfer)
+add_cmdline_test(preview-cgal   EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_LINEAR_EXTRUDE_CHAMFER_FILES} EXPECTEDDIR preview ARGS --enable=linear-extrude-chamfer --backend=cgal)
+add_cmdline_test(render-cgal    EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_LINEAR_EXTRUDE_CHAMFER_FILES} EXPECTEDDIR render ARGS --render --enable=linear-extrude-chamfer --backend=cgal)
+
+#
+# --enable=section-cut tests
+#
+list(APPEND EXPERIMENTAL_SECTION_CUT_FILES
+  ${TEST_SCAD_DIR}/3D/features/cut-tests.scad
+)
+add_cmdline_test(dump           EXPERIMENTAL OPENSCAD SUFFIX csg FILES ${EXPERIMENTAL_SECTION_CUT_FILES} ARGS --enable=section-cut)
+add_cmdline_test(render-manifold EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_SECTION_CUT_FILES} EXPECTEDDIR render ARGS --render --enable=section-cut --backend=manifold)
+
+#
+# --enable=shell tests (offset3d / shell 3D enclosure primitives)
+#
+list(APPEND EXPERIMENTAL_SHELL_FILES
+  ${TEST_SCAD_DIR}/3D/features/offset3d-tests.scad
+)
+add_cmdline_test(dump           EXPERIMENTAL OPENSCAD SUFFIX csg FILES ${EXPERIMENTAL_SHELL_FILES} ARGS --enable=shell)
+add_cmdline_test(render-manifold EXPERIMENTAL OPENSCAD SUFFIX png FILES ${EXPERIMENTAL_SHELL_FILES} EXPECTEDDIR render ARGS --render --enable=shell --backend=manifold)
 
 #
 # --enable=vector-swizzle tests

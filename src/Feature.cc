@@ -33,6 +33,26 @@ const Feature Feature::ExperimentalVxORenderersIndexing("vertex-object-renderers
                                                         "Enable indexing in vertex object renderers");
 const Feature Feature::ExperimentalTextMetricsFunctions(
   "textmetrics", "Enable the <code>textmetrics()</code> and <code>fontmetrics()</code> functions.");
+const Feature Feature::ExperimentalLinearExtrudeChamfer(
+  "linear-extrude-chamfer",
+  "Enable the <code>chamfer</code> and <code>draft</code> parameters of <code>linear_extrude()</code>.");
+const Feature Feature::ExperimentalSectionCut(
+  "section-cut",
+  "Enable the <code>cut()</code> half-space section cut operator and the <code>--cut</code> CLI option.");
+const Feature Feature::ExperimentalShell(
+  "shell",
+  "Enable the <code>shell()</code> hollowing operator and the <code>offset3d()</code> 3D surface "
+  "offset operator.");
+const Feature Feature::ExperimentalExportObject(
+  "export-object",
+  "Enable the <code>export_object()</code> operator to tag a child with a name and material that "
+  "survive into 3MF export.");
+const Feature Feature::ExperimentalGeometryMetrics(
+  "geometry-metrics",
+  "Enable the <code>bbox()</code>, <code>centroid()</code>, <code>volume()</code> and "
+  "<code>overhang()</code> geometry introspection functions. Called inside a module they measure "
+  "the module's children (all, or child <code>i</code>) by eagerly evaluating their geometry; "
+  "<code>bbox()</code>/<code>centroid()</code> also accept an explicit point list.");
 const Feature Feature::ExperimentalImportFunction(
   "import-function", "Enable import function returning data instead of geometry.");
 const Feature Feature::ExperimentalObjectFunction(

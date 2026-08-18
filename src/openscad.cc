@@ -100,6 +100,10 @@
 #include "geometry/GeometryEvaluator.h"
 #include "geometry/GeometryUtils.h"
 #include "geometry/PolySet.h"
+#include "geometry/linalg.h"
+#ifdef ENABLE_MANIFOLD
+#include "geometry/manifold/manifoldutils.h"
+#endif
 #include "glview/Camera.h"
 #include "glview/ColorMap.h"
 #include "glview/OffscreenView.h"
@@ -178,6 +182,7 @@ struct CommandLine {
   const AnimateArgs animate;
   const std::vector<std::string> summaryOptions;
   const std::string summaryFile;
+  const boost::optional<Vector4d> cut_plane;
 };
 
 namespace {
@@ -387,6 +392,30 @@ Camera get_camera(const po::variables_map& vm)
   return camera;
 }
 
+// Parse the --cut='a,b,c,d' option into a plane (normal a,b,c; offset d).
+boost::optional<Vector4d> get_cut_plane(const po::variables_map& vm)
+{
+  if (!vm.count("cut")) {
+    return boost::none;
+  }
+  std::vector<std::string> strs;
+  boost::split(strs, vm["cut"].as<std::string>(), boost::is_any_of(","));
+  if (strs.size() != 4) {
+    LOG("The --cut option requires 4 numbers: 'a,b,c,d' (plane normal a,b,c and offset d)");
+    exit(1);
+  }
+  try {
+    Vector4d plane;
+    for (size_t i = 0; i < 4; ++i) {
+      plane[i] = boost::lexical_cast<double>(strs[i]);
+    }
+    return plane;
+  } catch (boost::bad_lexical_cast&) {
+    LOG("The --cut option requires numbers as parameters");
+    exit(1);
+  }
+}
+
 int do_export(const CommandLine& cmd, const RenderVariables& render_variables, FileFormat export_format,
               SourceFile *root_file)
 {
@@ -506,6 +535,18 @@ int do_export(const CommandLine& cmd, const RenderVariables& render_variables, F
         }
         LOG("Converted to backend-specific geometry");
       }
+    }
+
+    // Apply the --cut section cut to the evaluated geometry before export, so it
+    // flows into all exporters (STL/3MF/PNG) automatically.
+    if (cmd.cut_plane && root_geom && root_geom->getDimension() == 3) {
+#ifdef ENABLE_MANIFOLD
+      root_geom = ManifoldUtils::trimByPlane(root_geom, *cmd.cut_plane);
+#else
+      LOG("The --cut option requires the Manifold backend; ignoring cut.");
+#endif
+    } else if (cmd.cut_plane) {
+      LOG("The --cut option only applies to 3D geometry; ignoring cut.");
     }
 
     const std::string input_filename = cmd.is_stdin ? "<stdin>" : cmd.filename;
@@ -884,6 +925,8 @@ int openscad_main(int argc, char **argv)
     ("backend", po::value<std::string>(),
       "3D rendering backend to use: 'CGAL' (old/slow) or 'Manifold' (new/fast) [default]")
     ("imgsize", po::value<std::string>(), "=width,height of exported png")
+    ("cut", po::value<std::string>(),
+      "cut section: plane 'a,b,c,d' (normal a,b,c, offset d) applied to geometry before export")
     ("render", po::value<std::string>()->implicit_value(""),
       "for full geometry evaluation when exporting png")
     ("preview", po::value<std::string>()->implicit_value(""),
@@ -1175,7 +1218,8 @@ int openscad_main(int argc, char **argv)
                                 animate,
                                 vm.count("summary") ? vm["summary"].as<std::vector<std::string>>()
                                                     : std::vector<std::string>{},
-                                vm.count("summary-file") ? vm["summary-file"].as<std::string>() : ""};
+                                vm.count("summary-file") ? vm["summary-file"].as<std::string>() : "",
+                                get_cut_plane(vm)};
           rc |= cmdline(cmd);
         }
       }

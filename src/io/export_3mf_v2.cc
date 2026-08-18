@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <lib3mf_implicit.hpp>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -69,6 +70,12 @@ struct ExportContext {
   Color4f selectedColor;
   const ExportInfo& info;
   const std::shared_ptr<const Export3mfOptions> options;
+  // Per-object materials requested via export_object(material=...). Created
+  // lazily; identical material names dedupe to a single lib3mf material so the
+  // slicer sees one entry per distinct name. Independent of the color-mode
+  // groups above, so it doesn't affect color/basematerial color export.
+  Lib3MF::PBaseMaterialGroup objectMaterialGroup;
+  std::map<std::string, Lib3MF_uint32> objectMaterialIndices;
 };
 
 // lib3mf v2.x WriteCallback / SeekCallback typedefs
@@ -170,11 +177,38 @@ bool append_polyset(const std::shared_ptr<const PolySet>& ps, ExportContext& ctx
     const auto modelname =
       ctx.modelcount == 1 ? "OpenSCAD Model" : "OpenSCAD Model " + std::to_string(mesh_count);
     const auto partname = ctx.modelcount == 1 ? "" : "Part " + std::to_string(mesh_count);
-    mesh->SetName(modelname);
+    // export_object(name=...) overrides the generic model name.
+    mesh->SetName(ps->objectName.empty() ? modelname : ps->objectName);
     if (ctx.basematerialgroup) {
       mesh->SetObjectLevelProperty(ctx.basematerialgroup->GetUniqueResourceID(), 1);
     } else if (ctx.colorgroup) {
       mesh->SetObjectLevelProperty(ctx.colorgroup->GetUniqueResourceID(), 1);
+    }
+
+    // export_object(material=...) assigns a named per-object base material,
+    // deduped by name so identical materials share one lib3mf entry. This
+    // overrides the object-level property set above (per-triangle colors, set
+    // via handle_triangle_color, still win over the object-level default).
+    if (!ps->objectMaterial.empty()) {
+      if (!ctx.objectMaterialGroup) {
+        ctx.objectMaterialGroup = ctx.model->AddBaseMaterialGroup();
+      }
+      const auto mat_it = ctx.objectMaterialIndices.find(ps->objectMaterial);
+      Lib3MF_uint32 mat_idx;
+      if (mat_it == ctx.objectMaterialIndices.end()) {
+        Lib3MF::sColor displaycolor;
+        Color4f col = !ps->colors.empty() ? ps->colors.front() : ctx.selectedColor;
+        if (!col.getRgba(displaycolor.m_Red, displaycolor.m_Green, displaycolor.m_Blue,
+                         displaycolor.m_Alpha)) {
+          LOG(message_group::Warning, "Invalid color in 3MF export");
+        }
+        displaycolor.m_Alpha = 0xff;
+        mat_idx = ctx.objectMaterialGroup->AddMaterial(ps->objectMaterial, displaycolor);
+        ctx.objectMaterialIndices[ps->objectMaterial] = mat_idx;
+      } else {
+        mat_idx = mat_it->second;
+      }
+      mesh->SetObjectLevelProperty(ctx.objectMaterialGroup->GetUniqueResourceID(), mat_idx);
     }
 
     auto vertexFunc = [&](const Vector3d& coords) -> bool {

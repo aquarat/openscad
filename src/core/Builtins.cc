@@ -59,6 +59,9 @@ extern void register_builtin_import();
 extern void register_builtin_projection();
 extern void register_builtin_cgaladv();
 extern void register_builtin_offset();
+extern void register_builtin_cut();
+extern void register_builtin_offset3d();
+extern void register_builtin_export_object();
 extern void register_builtin_linear_extrude();
 extern void register_builtin_rotate_extrude();
 #if defined(ENABLE_EXPERIMENTAL) && defined(ENABLE_CGAL)
@@ -90,6 +93,9 @@ void Builtins::initialize()
   register_builtin_projection();
   register_builtin_cgaladv();
   register_builtin_offset();
+  register_builtin_cut();
+  register_builtin_offset3d();
+  register_builtin_export_object();
   register_builtin_linear_extrude();
   register_builtin_rotate_extrude();
 #if defined(ENABLE_EXPERIMENTAL) && defined(ENABLE_CGAL)

@@ -1029,6 +1029,9 @@ set(CORE_SOURCES
   src/core/NodeDumper.cc
   src/core/NodeVisitor.cc
   src/core/OffsetNode.cc
+  src/core/CutNode.cc
+  src/core/Offset3dNode.cc
+  src/core/ExportObjectNode.cc
   src/core/Parameters.cc
   src/core/ProjectionNode.cc
   src/core/RenderNode.cc

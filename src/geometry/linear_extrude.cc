@@ -351,6 +351,186 @@ void prepareVerticesAndIndices(const Polygon2d& polyref, Vector3d h1, Vector3d h
   }
 }
 
+/**
+ * Inset a single outline by perpendicular distance @p d (mm) using miter joins,
+ * preserving vertex count and order so that consecutive rings can be lofted
+ * directly (edge-to-edge). Positive @p d shrinks the enclosed solid: outer
+ * (CCW) contours move inward, hole (CW) contours move outward, so the solid
+ * always gets smaller.
+ *
+ * This is a lightweight per-vertex inset intended for the small chamfer/draft
+ * insets of the experimental DFM feature. It is NOT robust against large insets
+ * on concave or thin profiles (no self-intersection cleanup); those cases would
+ * want a Clipper offset + general loft instead. See extrudePolygonChamfered().
+ */
+Outline2d insetOutline(const Outline2d& o, double d)
+{
+  Outline2d result;
+  result.positive = o.positive;
+  const size_t n = o.vertices.size();
+  if (d == 0.0 || n < 3) {
+    result.vertices = o.vertices;
+    return result;
+  }
+
+  // Signed area gives orientation so the inset always moves toward the solid,
+  // independent of whether this is an outer contour or a hole.
+  double area2 = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const Vector2d& a = o.vertices[i];
+    const Vector2d& b = o.vertices[(i + 1) % n];
+    area2 += a[0] * b[1] - b[0] * a[1];
+  }
+  const double sign = area2 >= 0 ? 1.0 : -1.0;
+
+  result.vertices.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    const Vector2d& prev = o.vertices[(i + n - 1) % n];
+    const Vector2d& cur = o.vertices[i];
+    const Vector2d& next = o.vertices[(i + 1) % n];
+
+    Vector2d din = cur - prev;
+    Vector2d dout = next - cur;
+    const double lin = din.norm();
+    const double lout = dout.norm();
+    if (lin < 1e-9 || lout < 1e-9) {
+      result.vertices.push_back(cur);
+      continue;
+    }
+    din /= lin;
+    dout /= lout;
+    // Left-hand normals (point to the interior of a CCW contour).
+    const Vector2d nin(-din[1], din[0]);
+    const Vector2d nout(-dout[1], dout[0]);
+    Vector2d miter = nin + nout;
+    const double mlen = miter.norm();
+    if (mlen < 1e-6) {
+      // ~180deg spike: fall back to a plain edge-normal offset.
+      result.vertices.push_back(cur + sign * d * nin);
+      continue;
+    }
+    miter /= mlen;
+    double cosHalf = miter.dot(nin);
+    // Clamp the miter length so very sharp corners don't shoot off to infinity.
+    if (cosHalf < 0.1) cosHalf = 0.1;
+    result.vertices.push_back(cur + sign * (d / cosHalf) * miter);
+  }
+  return result;
+}
+
+/**
+ * Build a linear extrusion whose top and/or bottom rim is chamfered (a 45deg
+ * self-supporting bevel) and/or whose sidewalls are drafted (tapered inward
+ * toward the top). Composes with the existing scale/twist transforms.
+ *
+ * The solid is generated as a stack of rings, each with the same vertex count
+ * and ordering as @p polyref: every ring applies the interpolated scale/twist
+ * affine transform and then an inward inset that depends on height. Chamfer
+ * rings sit at the rim (max inset) and one chamfer-depth in (zero inset); draft
+ * adds an inset that grows linearly with height across the whole extrusion.
+ * Because all rings share topology, side walls are simple edge-to-edge quads and
+ * the end caps reuse the profile tessellation.
+ */
+std::unique_ptr<PolySet> extrudePolygonChamfered(const LinearExtrudeNode& node,
+                                                 const Polygon2d& polyref, const Vector3d& h1,
+                                                 const Vector3d& h2, size_t num_slices,
+                                                 boost::tribool isConvex)
+{
+  const Vector3d axis = h2 - h1;
+  const double length = axis.norm();
+
+  const bool cham_bot = node.chamfer > 0 && node.chamfer_bottom;
+  const bool cham_top = node.chamfer > 0 && node.chamfer_top;
+  const double draft_tan = node.draft != 0.0 ? tan_degrees(node.draft) : 0.0;
+
+  // Fraction of the total length consumed by each chamfer bevel.
+  const double cb = cham_bot ? node.chamfer / length : 0.0;
+  const double ct = cham_top ? node.chamfer / length : 0.0;
+  assert(cb + ct < 1.0 && "chamfer(s) must fit within extrusion height");
+
+  int slice_stride = 0;
+  for (const auto& o : polyref.outlines()) slice_stride += static_cast<int>(o.vertices.size());
+
+  // Ring height-fractions in [0,1]: rim rings plus evenly-spaced core rings.
+  std::vector<double> fracs;
+  if (cb > 0) fracs.push_back(0.0);
+  for (size_t k = 0; k <= num_slices; ++k) {
+    fracs.push_back(cb + (1.0 - cb - ct) * static_cast<double>(k) / static_cast<double>(num_slices));
+  }
+  if (ct > 0) fracs.push_back(1.0);
+  const int num_rings = static_cast<int>(fracs.size());
+
+  // Total inward inset at absolute distance `dist` from the bottom face.
+  auto insetAt = [&](double dist) {
+    double d = draft_tan > 0 ? draft_tan * dist : 0.0;
+    if (cham_bot) d = std::max(d, node.chamfer - dist);
+    if (cham_top) d = std::max(d, node.chamfer - (length - dist));
+    return std::max(d, 0.0);
+  };
+
+  auto final_polyset = std::make_unique<PolySet>(3, isConvex);
+  final_polyset->setTriangular(true);
+  final_polyset->setConvexity(node.convexity);
+  auto& vertices = final_polyset->vertices;
+  auto& indices = final_polyset->indices;
+  vertices.reserve(static_cast<size_t>(slice_stride) * num_rings);
+
+  const Vector2d full_scale(1 - node.scale_x, 1 - node.scale_y);
+  const double full_rot = -node.twist;
+
+  // Ring vertices.
+  for (int r = 0; r < num_rings; ++r) {
+    const double f = fracs[r];
+    const double d = insetAt(f * length);
+    Eigen::Affine2d trans(Eigen::Scaling(Vector2d(1, 1) - full_scale * f) *
+                          Eigen::Affine2d(rotate_degrees(full_rot * f)));
+    const Vector3d ringpos = h1 + axis * f;
+    for (const auto& o : polyref.outlines()) {
+      // Apply the scale/twist transform, then inset the transformed ring.
+      Outline2d transformed;
+      transformed.positive = o.positive;
+      transformed.vertices.reserve(o.vertices.size());
+      for (const auto& v : o.vertices) transformed.vertices.push_back(trans * v);
+      const Outline2d inset = insetOutline(transformed, d);
+      for (const auto& v : inset.vertices) {
+        vertices.emplace_back(Vector3d(v[0], v[1], 0.0) + ringpos);
+      }
+    }
+  }
+
+  // Side walls: connect consecutive rings edge-to-edge (winding matches the rest
+  // of the extrude code / add_slice_indices, so normals face outward).
+  for (int r = 1; r < num_rings; ++r) {
+    const int bot = (r - 1) * slice_stride;
+    const int top = r * slice_stride;
+    int curr_outline = 0;
+    for (const auto& o : polyref.outlines()) {
+      const int cnt = static_cast<int>(o.vertices.size());
+      for (int i = 0; i < cnt; ++i) {
+        const int a = curr_outline + i;
+        const int b = curr_outline + (i + 1) % cnt;
+        indices.push_back({bot + b, top + b, bot + a});
+        indices.push_back({top + a, bot + a, top + b});
+      }
+      curr_outline += cnt;
+    }
+  }
+
+  // End caps: reuse the profile tessellation topology (index-preserving inset
+  // keeps the same connectivity) for the bottom (reversed) and top rings.
+  auto cap = polyref.tessellate();
+  const int top_offset = (num_rings - 1) * slice_stride;
+  for (const auto& p : cap->indices) {
+    indices.emplace_back(p.rbegin(), p.rend());  // bottom face, reversed winding
+    IndexedFace tp;
+    tp.reserve(p.size());
+    for (int idx : p) tp.push_back(idx + top_offset);
+    indices.push_back(std::move(tp));  // top face
+  }
+
+  return final_polyset;
+}
+
 }  // namespace LinearExtrudeInternals
 
 using namespace LinearExtrudeInternals;
@@ -396,6 +576,13 @@ std::unique_ptr<Geometry> extrudePolygon(const LinearExtrudeNode& node, const Po
   if (node.center) {
     h1 -= node.height / 2.0;
     h2 -= node.height / 2.0;
+  }
+
+  // Experimental DFM chamfer/draft: build via the ring-stack chamfer builder.
+  // (Chamfering/drafting can make an otherwise-convex profile non-convex.)
+  const bool uses_chamfer = node.chamfer > 0 && (node.chamfer_top || node.chamfer_bottom);
+  if (uses_chamfer || node.draft != 0.0) {
+    return extrudePolygonChamfered(node, polyref, h1, h2, num_slices, unknown);
   }
 
   int slice_stride = 0;

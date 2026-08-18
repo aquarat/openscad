@@ -51,6 +51,13 @@ public:
 
   virtual void accept(GeometryVisitor& visitor) const = 0;
 
+  // Optional export metadata attached by export_object(). Default-empty so it
+  // changes nothing unless explicitly stamped. Preserved by the default copy
+  // constructors used in each subclass' copy(), and propagated across the
+  // Manifold->PolySet conversion in ManifoldGeometry::toPolySet().
+  std::string objectName;
+  std::string objectMaterial;
+
 protected:
   int convexity{1};
 };

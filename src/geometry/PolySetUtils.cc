@@ -70,6 +70,10 @@ std::unique_ptr<PolySet> tessellate_faces(const PolySet& polyset)
   result->setConvexity(polyset.getConvexity());
   result->setTriangular(true);
   result->setManifold(polyset.isManifold());
+  // Preserve export_object() metadata across the tessellation rebuild so it
+  // still reaches the exporters (e.g. 3MF names/materials).
+  result->objectName = polyset.objectName;
+  result->objectMaterial = polyset.objectMaterial;
   // ideally this should not require a copy...
   if (polyset.isTriangular()) {
     result->vertices = polyset.vertices;

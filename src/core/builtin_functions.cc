@@ -51,10 +51,19 @@
 #include "io/import.h"
 #include "utils/boost-utils.h"
 #include "utils/degree_trig.h"
+#include "utils/exceptions.h"
 #include "utils/printutils.h"
 #include "version.h"
 // hash double
 #include "geometry/linalg.h"
+// Geometry introspection (bbox/centroid/volume/overhang)
+#include "core/Children.h"
+#include "core/Tree.h"
+#include "core/node.h"
+#include "geometry/Geometry.h"
+#include "geometry/GeometryEvaluator.h"
+#include "geometry/PolySet.h"
+#include "geometry/PolySetUtils.h"
 
 #if defined __WIN32__ || defined _MSC_VER
 #include <process.h>
@@ -1032,6 +1041,384 @@ Value builtin_fontmetrics(Arguments arguments, const Location& loc)
   return std::move(font_metrics);
 }
 
+/*
+ * Geometry introspection: bbox(), centroid(), volume() and overhang().
+ *
+ * These builtin FUNCTIONS are meant to be called inside a user-module body so
+ * that they can measure that module's children. A builtin function reaches the
+ * enclosing module's children via context->user_module_children() -- the exact
+ * mechanism the children() builtin uses (see src/core/control.cc). The child
+ * ModuleInstantiations are materialized into a real node subtree (Children::
+ * instantiate) and then eagerly geometry-evaluated with a scoped, throwaway
+ * GeometryEvaluator. Running this sub-evaluation during the module-instantiation
+ * (pass-1) build is safe: the geometry cache is content-addressed (keyed on the
+ * structural Tree::getIdString dump, not on node index), so a scoped
+ * sub-evaluation cannot corrupt the later main GeometryEvaluator pass.
+ *
+ * Each of bbox()/centroid() also accepts an explicit list of points (the pure,
+ * geometry-free path -- kept working exactly as before), and bbox()/centroid()/
+ * volume() additionally accept a single child-index argument to measure just
+ * one child. All four are gated behind Feature::ExperimentalGeometryMetrics.
+ */
+
+// Reads a Value expected to be a non-empty list of 2D or 3D points into `points`.
+// Returns true on success and sets `dims` to 2 or 3. Returns false (no throw) if
+// the value is not a usable point list, so callers can emit a tailored message.
+static bool read_point_list(const Value& value, std::vector<Vector3d>& points, int& dims)
+{
+  if (value.type() != Value::Type::VECTOR) return false;
+  const VectorType& vec = value.toVector();
+  if (vec.size() == 0) return false;
+  dims = 0;
+  for (const auto& element : vec) {
+    double x, y, z = 0.0;
+    if (element.getVec3(x, y, z)) {
+      if (dims == 0) dims = 3;
+      else if (dims != 3) return false;
+    } else if (element.getVec2(x, y)) {
+      if (dims == 0) dims = 2;
+      else if (dims != 2) return false;
+      z = 0.0;
+    } else {
+      return false;
+    }
+    points.emplace_back(x, y, z);
+  }
+  return !points.empty();
+}
+
+// Eagerly instantiate the enclosing user module's children (all of them, or the
+// given `indices`) into a scratch node tree and geometry-evaluate them. Returns
+// the resulting geometry (which may be null or empty). Returns nullptr without
+// throwing when there is no enclosing module (no user_module_children) -- the
+// caller distinguishes that case up front and emits its own tailored message.
+static std::shared_ptr<const Geometry> evaluate_children_geometry(
+  const std::shared_ptr<const Context>& context, const std::vector<size_t> *indices)
+{
+  const Children *children = context->user_module_children();
+  if (!children) {
+    return nullptr;
+  }
+  // A RootNode is a self-contained GroupNode (it owns its ModuleInstantiation),
+  // which makes it a convenient anonymous container to instantiate children into.
+  auto root = std::make_shared<RootNode>();
+  if (indices) {
+    children->instantiate(root, *indices);
+  } else {
+    children->instantiate(root);
+  }
+  Tree tree(root, context->documentRoot());
+  GeometryEvaluator evaluator(tree);
+  return evaluator.evaluateGeometry(*root, true);
+}
+
+// Convenience wrapper: throw a clear error when a metric function that measures
+// children is not actually called inside a module, otherwise return the eagerly
+// evaluated children geometry (possibly null/empty).
+static std::shared_ptr<const Geometry> require_children_geometry(
+  const char *name, const std::shared_ptr<const Context>& context,
+  const std::vector<size_t> *indices)
+{
+  if (!context->user_module_children()) {
+    throw EvaluationException(STR(boost::format(
+      "%1$s(): must be called inside a module (to measure its children), or with an explicit "
+      "list of points, e.g. %1$s([[0,0,0],[1,2,3]]).") % name));
+  }
+  return evaluate_children_geometry(context, indices);
+}
+
+// Parse a single NUMBER argument as a child index and validate it against the
+// enclosing module's child count. Returns false (with a warning) if out of range.
+static bool metric_child_index(const char *name, const std::shared_ptr<const Context>& context,
+                               const Value& value, const Location& loc, size_t& out)
+{
+  const Children *children = context->user_module_children();
+  const int i = static_cast<int>(value.toDouble());
+  const size_t count = children ? children->size() : 0;
+  if (i < 0 || static_cast<size_t>(i) >= count) {
+    LOG(message_group::Warning, loc, context->documentRoot(),
+        "%1$s(): child index %2$d out of range (module has %3$lu children).", name, i, count);
+    return false;
+  }
+  out = static_cast<size_t>(i);
+  return true;
+}
+
+// Returns the triangulated PolySet for a geometry, or nullptr if it cannot be
+// represented as one (e.g. empty or a pure 2D Polygon2d).
+static std::shared_ptr<const PolySet> geometry_as_triangle_polyset(
+  const std::shared_ptr<const Geometry>& geom)
+{
+  if (!geom) return nullptr;
+  auto ps = PolySetUtils::getGeometryAsPolySet(geom);
+  if (!ps || ps->isEmpty()) return nullptr;
+  if (ps->isTriangular()) return ps;
+  return PolySetUtils::tessellate_faces(*ps);
+}
+
+// Signed mesh volume via the divergence theorem over triangles (each triangle,
+// together with the origin, forms a tetrahedron whose signed volume is summed).
+// Also accumulates the volume-weighted centroid. `ps` must be triangulated.
+// Returns the signed total volume; `centroid` is only meaningful when |volume|>0.
+static double polyset_volume_centroid(const PolySet& ps, Vector3d& centroid)
+{
+  double vol6 = 0.0;        // 6 * signed volume
+  Vector3d acc = Vector3d::Zero();  // sum of (6*tetraVol) * (v0+v1+v2)
+  for (const auto& face : ps.indices) {
+    if (face.size() < 3) continue;
+    const Vector3d& v0 = ps.vertices[face[0]];
+    const Vector3d& v1 = ps.vertices[face[1]];
+    const Vector3d& v2 = ps.vertices[face[2]];
+    const double sv = v0.dot(v1.cross(v2));  // = 6 * signed tetra volume
+    vol6 += sv;
+    acc += sv * (v0 + v1 + v2);
+  }
+  const double volume = vol6 / 6.0;
+  if (std::abs(vol6) > 1e-9) {
+    // centroid = sum(tetraVol * tetraCentroid) / sum(tetraVol)
+    //          = sum( (sv/6) * (v0+v1+v2)/4 ) / (vol6/6) = acc / (4*vol6)
+    centroid = acc / (4.0 * vol6);
+  }
+  return volume;
+}
+
+// Fallback centroid for degenerate/flat/2D meshes: plain average of vertices.
+static Vector3d polyset_vertex_average(const PolySet& ps)
+{
+  Vector3d sum = Vector3d::Zero();
+  for (const auto& v : ps.vertices) sum += v;
+  if (!ps.vertices.empty()) sum /= static_cast<double>(ps.vertices.size());
+  return sum;
+}
+
+static Value make_bbox_value(EvaluationSession *session, const BoundingBox& bb)
+{
+  VectorType minv(session);
+  VectorType maxv(session);
+  for (int i = 0; i < 3; ++i) minv.emplace_back(bb.min()[i]);
+  for (int i = 0; i < 3; ++i) maxv.emplace_back(bb.max()[i]);
+  VectorType result(session);
+  result.emplace_back(std::move(minv));
+  result.emplace_back(std::move(maxv));
+  return std::move(result);
+}
+
+Value builtin_bbox(const std::shared_ptr<const Context>& context, const FunctionCall *call)
+{
+  Arguments arguments{call->arguments, context};
+  const Location& loc = call->location();
+  auto *session = arguments.session();
+
+  // Point-list form: bbox([[x,y,z], ...]) -> [[min],[max]] (2D or 3D).
+  if (arguments.size() == 1 && arguments[0]->type() == Value::Type::VECTOR) {
+    std::vector<Vector3d> points;
+    int dims = 0;
+    if (read_point_list(arguments[0].value, points, dims)) {
+      Vector3d lo = points.front();
+      Vector3d hi = points.front();
+      for (const auto& p : points) {
+        lo = lo.cwiseMin(p);
+        hi = hi.cwiseMax(p);
+      }
+      VectorType minv(session);
+      VectorType maxv(session);
+      for (int i = 0; i < dims; ++i) {
+        minv.emplace_back(lo[i]);
+        maxv.emplace_back(hi[i]);
+      }
+      VectorType result(session);
+      result.emplace_back(std::move(minv));
+      result.emplace_back(std::move(maxv));
+      return std::move(result);
+    }
+    throw EvaluationException(STR(boost::format(
+      "bbox(): vector argument must be a non-empty list of 2D or 3D points.")));
+  }
+
+  // Geometry form: bbox() -> all children, bbox(i) -> child index i.
+  std::vector<size_t> indices;
+  const std::vector<size_t> *idxptr = nullptr;
+  if (arguments.size() == 1) {
+    if (arguments[0]->type() != Value::Type::NUMBER) {
+      throw EvaluationException(STR(boost::format(
+        "bbox(): argument must be a child index (number) or a list of points.")));
+    }
+    size_t idx = 0;
+    if (!metric_child_index("bbox", context, arguments[0].value, loc, idx)) {
+      return Value::undefined.clone();
+    }
+    indices.push_back(idx);
+    idxptr = &indices;
+  } else if (arguments.size() != 0) {
+    throw EvaluationException(STR(boost::format(
+      "bbox(): expected 0 arguments, 1 child index, or 1 list of points.")));
+  }
+
+  auto geom = require_children_geometry("bbox", context, idxptr);
+  if (!geom || geom->isEmpty()) {
+    LOG(message_group::Warning, loc, context->documentRoot(),
+        "bbox(): children produced no geometry; returning undef.");
+    return Value::undefined.clone();
+  }
+  return make_bbox_value(session, geom->getBoundingBox());
+}
+
+Value builtin_centroid(const std::shared_ptr<const Context>& context, const FunctionCall *call)
+{
+  Arguments arguments{call->arguments, context};
+  const Location& loc = call->location();
+  auto *session = arguments.session();
+
+  // Point-list form: centroid([[x,y,z], ...]) -> average of the points.
+  if (arguments.size() == 1 && arguments[0]->type() == Value::Type::VECTOR) {
+    std::vector<Vector3d> points;
+    int dims = 0;
+    if (read_point_list(arguments[0].value, points, dims)) {
+      Vector3d sum = Vector3d::Zero();
+      for (const auto& p : points) sum += p;
+      sum /= static_cast<double>(points.size());
+      VectorType result(session);
+      for (int i = 0; i < dims; ++i) result.emplace_back(sum[i]);
+      return std::move(result);
+    }
+    throw EvaluationException(STR(boost::format(
+      "centroid(): vector argument must be a non-empty list of 2D or 3D points.")));
+  }
+
+  // Geometry form: centroid() -> all children, centroid(i) -> child index i.
+  std::vector<size_t> indices;
+  const std::vector<size_t> *idxptr = nullptr;
+  if (arguments.size() == 1) {
+    if (arguments[0]->type() != Value::Type::NUMBER) {
+      throw EvaluationException(STR(boost::format(
+        "centroid(): argument must be a child index (number) or a list of points.")));
+    }
+    size_t idx = 0;
+    if (!metric_child_index("centroid", context, arguments[0].value, loc, idx)) {
+      return Value::undefined.clone();
+    }
+    indices.push_back(idx);
+    idxptr = &indices;
+  } else if (arguments.size() != 0) {
+    throw EvaluationException(STR(boost::format(
+      "centroid(): expected 0 arguments, 1 child index, or 1 list of points.")));
+  }
+
+  auto geom = require_children_geometry("centroid", context, idxptr);
+  auto ps = geometry_as_triangle_polyset(geom);
+  if (!ps) {
+    LOG(message_group::Warning, loc, context->documentRoot(),
+        "centroid(): children produced no measurable 3D geometry; returning undef.");
+    return Value::undefined.clone();
+  }
+  Vector3d centroid = Vector3d::Zero();
+  const double volume = polyset_volume_centroid(*ps, centroid);
+  if (std::abs(volume) <= 1e-9) {
+    // Flat/2D/degenerate: fall back to the vertex average.
+    centroid = polyset_vertex_average(*ps);
+  }
+  VectorType result(session);
+  for (int i = 0; i < 3; ++i) result.emplace_back(centroid[i]);
+  return std::move(result);
+}
+
+Value builtin_volume(const std::shared_ptr<const Context>& context, const FunctionCall *call)
+{
+  Arguments arguments{call->arguments, context};
+  const Location& loc = call->location();
+
+  // volume() -> all children, volume(i) -> child index i.
+  std::vector<size_t> indices;
+  const std::vector<size_t> *idxptr = nullptr;
+  if (arguments.size() == 1) {
+    if (arguments[0]->type() != Value::Type::NUMBER) {
+      throw EvaluationException(STR(boost::format(
+        "volume(): argument must be a child index (number).")));
+    }
+    size_t idx = 0;
+    if (!metric_child_index("volume", context, arguments[0].value, loc, idx)) {
+      return Value::undefined.clone();
+    }
+    indices.push_back(idx);
+    idxptr = &indices;
+  } else if (arguments.size() != 0) {
+    throw EvaluationException(STR(boost::format(
+      "volume(): expected 0 arguments or 1 child index.")));
+  }
+
+  auto geom = require_children_geometry("volume", context, idxptr);
+  auto ps = geometry_as_triangle_polyset(geom);
+  if (!ps) {
+    // No 3D solid (e.g. empty or purely 2D): report zero volume.
+    return {0.0};
+  }
+  Vector3d centroid = Vector3d::Zero();
+  const double volume = polyset_volume_centroid(*ps, centroid);
+  return {std::abs(volume)};
+}
+
+// overhang(): worst downward-facing surface angle, measured from vertical (deg).
+//
+// Convention: for every triangle we compute the outward unit normal from its
+// vertex winding. Downward-facing faces (normal.z < 0) are overhangs; the angle
+// reported is measured FROM VERTICAL -- i.e. 0 deg for a vertical wall and 90
+// deg for a fully horizontal downward face (a ceiling). FDM printers typically
+// print angles up to ~45 deg without support. Faces resting on the print bed
+// (all vertices within a small tolerance of the global minimum Z) are excluded
+// heuristically, since they are supported by the bed rather than overhanging.
+Value builtin_overhang(const std::shared_ptr<const Context>& context, const FunctionCall *call)
+{
+  Arguments arguments{call->arguments, context};
+  const Location& loc = call->location();
+
+  std::vector<size_t> indices;
+  const std::vector<size_t> *idxptr = nullptr;
+  if (arguments.size() == 1) {
+    if (arguments[0]->type() != Value::Type::NUMBER) {
+      throw EvaluationException(STR(boost::format(
+        "overhang(): argument must be a child index (number).")));
+    }
+    size_t idx = 0;
+    if (!metric_child_index("overhang", context, arguments[0].value, loc, idx)) {
+      return Value::undefined.clone();
+    }
+    indices.push_back(idx);
+    idxptr = &indices;
+  } else if (arguments.size() != 0) {
+    throw EvaluationException(STR(boost::format(
+      "overhang(): expected 0 arguments or 1 child index.")));
+  }
+
+  auto geom = require_children_geometry("overhang", context, idxptr);
+  auto ps = geometry_as_triangle_polyset(geom);
+  if (!ps) {
+    return {0.0};
+  }
+
+  // Global minimum Z, used to identify (and exclude) bed-contact faces.
+  double minz = std::numeric_limits<double>::infinity();
+  for (const auto& v : ps->vertices) minz = std::min(minz, v.z());
+  constexpr double bed_eps = 1e-4;
+
+  double max_angle = 0.0;
+  for (const auto& face : ps->indices) {
+    if (face.size() < 3) continue;
+    const Vector3d& v0 = ps->vertices[face[0]];
+    const Vector3d& v1 = ps->vertices[face[1]];
+    const Vector3d& v2 = ps->vertices[face[2]];
+    const Vector3d normal = (v1 - v0).cross(v2 - v0);
+    const double len = normal.norm();
+    if (len < 1e-12) continue;  // degenerate triangle
+    const double nz = normal.z() / len;
+    if (nz >= -1e-6) continue;  // not downward-facing
+    // Skip bed-contact faces (all vertices resting on the build plate).
+    if (v0.z() - minz < bed_eps && v1.z() - minz < bed_eps && v2.z() - minz < bed_eps) continue;
+    const double angle = asin_degrees(std::min(1.0, -nz));  // from vertical
+    max_angle = std::max(max_angle, angle);
+  }
+  return {max_angle};
+}
+
 Value builtin_is_undef(const std::shared_ptr<const Context>& context, const FunctionCall *call)
 {
   if (call->arguments.size() != 1) {
@@ -1336,5 +1723,33 @@ void register_builtin_functions()
   Builtins::init("import", new BuiltinFunction(&builtin_import, &Feature::ExperimentalImportFunction),
                  {
                    "import(file) -> object",
+                 });
+
+  Builtins::init("bbox", new BuiltinFunction(&builtin_bbox, &Feature::ExperimentalGeometryMetrics),
+                 {
+                   "bbox() -> [[min], [max]] of the enclosing module's children",
+                   "bbox(i) -> [[min], [max]] of child index i",
+                   "bbox(point list) -> [[min], [max]]",
+                 });
+
+  Builtins::init("centroid",
+                 new BuiltinFunction(&builtin_centroid, &Feature::ExperimentalGeometryMetrics),
+                 {
+                   "centroid() -> [cx, cy, cz] of the enclosing module's children",
+                   "centroid(i) -> [cx, cy, cz] of child index i",
+                   "centroid(point list) -> [cx, cy, cz]",
+                 });
+
+  Builtins::init("volume", new BuiltinFunction(&builtin_volume, &Feature::ExperimentalGeometryMetrics),
+                 {
+                   "volume() -> solid volume of the enclosing module's children",
+                   "volume(i) -> solid volume of child index i",
+                 });
+
+  Builtins::init("overhang",
+                 new BuiltinFunction(&builtin_overhang, &Feature::ExperimentalGeometryMetrics),
+                 {
+                   "overhang() -> worst downward-facing angle from vertical (degrees)",
+                   "overhang(i) -> worst downward-facing angle of child index i",
                  });
 }

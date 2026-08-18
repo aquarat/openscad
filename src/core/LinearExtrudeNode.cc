@@ -32,6 +32,7 @@
 #include <sstream>
 #include <utility>
 
+#include "Feature.h"
 #include "core/Builtins.h"
 #include "core/Children.h"
 #include "core/ModuleInstantiation.h"
@@ -47,7 +48,8 @@ std::shared_ptr<AbstractNode> builtin_linear_extrude(const ModuleInstantiation *
 {
   Parameters parameters = Parameters::parse(
     std::move(arguments), inst->location(),
-    {"height", "v", "scale", "center", "twist", "slices", "segments"}, {"convexity", "h"});
+    {"height", "v", "scale", "center", "twist", "slices", "segments"},
+    {"convexity", "h", "chamfer", "chamfer_top", "chamfer_bottom", "draft"});
   parameters.set_caller("linear_extrude");
 
   auto node = std::make_shared<LinearExtrudeNode>(inst, CurveDiscretizer(parameters, inst->location()));
@@ -101,6 +103,34 @@ std::shared_ptr<AbstractNode> builtin_linear_extrude(const ModuleInstantiation *
     node->has_twist = true;
   }
 
+  // DFM chamfer/draft (experimental).
+  node->chamfer = 0.0;
+  parameters["chamfer"].getFiniteDouble(node->chamfer);
+  if (node->chamfer < 0) node->chamfer = 0;
+  if (parameters["chamfer_top"].type() == Value::Type::BOOL)
+    node->chamfer_top = parameters["chamfer_top"].toBool();
+  if (parameters["chamfer_bottom"].type() == Value::Type::BOOL)
+    node->chamfer_bottom = parameters["chamfer_bottom"].toBool();
+  node->draft = 0.0;
+  parameters["draft"].getFiniteDouble(node->draft);
+
+  const bool uses_chamfer = node->chamfer > 0 && (node->chamfer_top || node->chamfer_bottom);
+  if (uses_chamfer || node->draft != 0.0) {
+    ExperimentalFeatureException::check(Feature::ExperimentalLinearExtrudeChamfer);
+
+    // The chamfer bevel consumes `chamfer` mm of height at each chamfered rim.
+    // Make sure the chamfered rims fit within the extrusion height.
+    if (uses_chamfer) {
+      const int rims = (node->chamfer_top ? 1 : 0) + (node->chamfer_bottom ? 1 : 0);
+      if (node->chamfer * rims >= node->height[2]) {
+        LOG(message_group::Warning, inst->location(), parameters.documentRoot(),
+            "linear_extrude(..., chamfer=%1$s) does not fit within height %2$s; ignoring chamfer.",
+            node->chamfer, node->height[2]);
+        node->chamfer = 0;
+      }
+    }
+  }
+
   children.instantiate(node);
 
   return node;
@@ -140,6 +170,15 @@ std::string LinearExtrudeNode::toString() const
     stream << ", scale = " << this->scale_x;
   }
 
+  if (this->chamfer > 0) {
+    stream << ", chamfer = " << this->chamfer;
+    if (!this->chamfer_top) stream << ", chamfer_top = false";
+    if (!this->chamfer_bottom) stream << ", chamfer_bottom = false";
+  }
+  if (this->draft != 0.0) {
+    stream << ", draft = " << this->draft;
+  }
+
   if (!(this->has_slices && this->has_segments)) {
     stream << ", " << this->discretizer;
   }
@@ -155,6 +194,6 @@ void register_builtin_linear_extrude()
   Builtins::init("linear_extrude", new BuiltinModule(builtin_linear_extrude),
                  {
                    "linear_extrude(height = 100, center = false, convexity = 1, twist = 0, scale = 1.0, "
-                   "[slices, segments, v])",
+                   "[slices, segments, v, chamfer, chamfer_top, chamfer_bottom, draft])",
                  });
 }

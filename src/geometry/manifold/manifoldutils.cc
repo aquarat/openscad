@@ -3,7 +3,9 @@
 
 #include <manifold/polygon.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -204,6 +206,107 @@ std::shared_ptr<const ManifoldGeometry> createManifoldFromGeometry(
     return createManifoldFromPolySet(*ps);
   }
   return nullptr;
+}
+
+std::shared_ptr<const Geometry> trimByPlane(const std::shared_ptr<const Geometry>& geom,
+                                            const Vector4d& plane)
+{
+  if (!geom || geom->isEmpty()) {
+    return std::make_shared<ManifoldGeometry>();
+  }
+
+  // Plane (a, b, c, d) => normal (a, b, c), offset d. manifold::TrimByPlane keeps
+  // the half-space in the direction of the normal, i.e. { p : normal.p >= offset }.
+  // Manifold expects the offset relative to a unit-length normal, so normalize
+  // both the normal and the offset accordingly.
+  Vector3d normal(plane[0], plane[1], plane[2]);
+  const double len = normal.norm();
+  if (len == 0.0) {
+    // Degenerate plane: no meaningful half-space, keep the geometry unchanged.
+    LOG(message_group::Warning, "Ignoring cut with degenerate (zero-length) plane normal.");
+    auto mani = createManifoldFromGeometry(geom);
+    return mani ? std::static_pointer_cast<const Geometry>(mani) : std::make_shared<ManifoldGeometry>();
+  }
+  normal /= len;
+  const double offset = plane[3] / len;
+
+  auto mani = createManifoldFromGeometry(geom);
+  if (!mani) {
+    return std::make_shared<ManifoldGeometry>();
+  }
+
+  auto trimmed =
+    mani->getManifold().TrimByPlane(manifold::vec3(normal.x(), normal.y(), normal.z()), offset);
+  if (trimmed.Status() != Error::NoError) {
+    LOG(message_group::Warning, "Cut (trimByPlane) failed: %1$s",
+        ManifoldUtils::statusToString(trimmed.Status()));
+    return std::make_shared<ManifoldGeometry>();
+  }
+
+  return std::make_shared<ManifoldGeometry>(trimmed);
+}
+
+std::shared_ptr<const Geometry> offset3D(const std::shared_ptr<const Geometry>& geom, double delta,
+                                         int segments)
+{
+  if (!geom || geom->isEmpty()) {
+    return std::make_shared<ManifoldGeometry>();
+  }
+
+  auto mani = createManifoldFromGeometry(geom);
+  if (!mani) {
+    return std::make_shared<ManifoldGeometry>();
+  }
+  if (delta == 0.0) {
+    return std::static_pointer_cast<const Geometry>(mani);
+  }
+
+  const int segs = std::max(segments, 4);
+  auto sphere = manifold::Manifold::Sphere(std::abs(delta), segs);
+
+  // delta > 0: dilate via Minkowski sum. delta < 0: erode via Minkowski difference.
+  auto result = (delta > 0.0) ? mani->getManifold().MinkowskiSum(sphere)
+                              : mani->getManifold().MinkowskiDifference(sphere);
+  if (result.Status() != Error::NoError) {
+    LOG(message_group::Warning, "offset3d() failed: %1$s",
+        ManifoldUtils::statusToString(result.Status()));
+    return std::make_shared<ManifoldGeometry>();
+  }
+  return std::make_shared<ManifoldGeometry>(result);
+}
+
+std::shared_ptr<const Geometry> shell3D(const std::shared_ptr<const Geometry>& geom, double thickness,
+                                        int segments)
+{
+  if (!geom || geom->isEmpty()) {
+    return std::make_shared<ManifoldGeometry>();
+  }
+
+  auto mani = createManifoldFromGeometry(geom);
+  if (!mani) {
+    return std::make_shared<ManifoldGeometry>();
+  }
+  if (thickness <= 0.0) {
+    LOG(message_group::Warning, "shell() requires thickness > 0; passing solid through unhollowed.");
+    return std::static_pointer_cast<const Geometry>(mani);
+  }
+
+  const int segs = std::max(segments, 4);
+  auto sphere = manifold::Manifold::Sphere(thickness, segs);
+
+  // Inner void = solid eroded inward by the wall thickness; wall = solid - void.
+  auto eroded = mani->getManifold().MinkowskiDifference(sphere);
+  if (eroded.Status() != Error::NoError) {
+    LOG(message_group::Warning, "shell() inner erosion failed: %1$s",
+        ManifoldUtils::statusToString(eroded.Status()));
+    return std::make_shared<ManifoldGeometry>();
+  }
+  auto wall = mani->getManifold() - eroded;
+  if (wall.Status() != Error::NoError) {
+    LOG(message_group::Warning, "shell() failed: %1$s", ManifoldUtils::statusToString(wall.Status()));
+    return std::make_shared<ManifoldGeometry>();
+  }
+  return std::make_shared<ManifoldGeometry>(wall);
 }
 
 Polygon2d polygonsToPolygon2d(const manifold::Polygons& polygons)

@@ -17,6 +17,11 @@ public:
   static const Feature ExperimentalLazyUnion;
   static const Feature ExperimentalVxORenderersIndexing;
   static const Feature ExperimentalTextMetricsFunctions;
+  static const Feature ExperimentalLinearExtrudeChamfer;
+  static const Feature ExperimentalSectionCut;
+  static const Feature ExperimentalShell;
+  static const Feature ExperimentalExportObject;
+  static const Feature ExperimentalGeometryMetrics;
   static const Feature ExperimentalImportFunction;
   static const Feature ExperimentalObjectFunction;
   static const Feature ExperimentalPredictibleOutput;

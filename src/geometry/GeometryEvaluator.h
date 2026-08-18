@@ -47,6 +47,9 @@ public:
   Response visit(State& state, const RenderNode& node) override;
   Response visit(State& state, const TextNode& node) override;
   Response visit(State& state, const OffsetNode& node) override;
+  Response visit(State& state, const CutNode& node) override;
+  Response visit(State& state, const Offset3dNode& node) override;
+  Response visit(State& state, const ExportObjectNode& node) override;
 
   [[nodiscard]] const Tree& getTree() const { return this->tree; }
 
