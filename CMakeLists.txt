@@ -1054,7 +1054,6 @@ set(CORE_SOURCES
   src/core/control.cc
   src/core/HTTPClient.cc
   src/core/AIClient.cc
-  src/core/AIService.cc
   src/core/customizer/Annotation.cc
   src/core/customizer/CommentParser.cc
   src/core/customizer/ParameterObject.cc
@@ -1362,6 +1361,9 @@ set(GUI_SOURCES
   src/gui/ai/AIDock.cc
   src/gui/ai/ChatWidget.cc
   src/gui/ai/ChatInputEdit.cc
+  # AIService pulls in QApplication/MainWindow, so it can only be part of GUI
+  # builds — a HEADLESS build has no callers for it (only ChatWidget uses it).
+  src/core/AIService.cc
   ${INPUT_DRIVER_SOURCES}
   )
 
