@@ -7,3 +7,12 @@ ECHO: "bbox", [[0, 0, 0], [10, 20, 30]]
 ECHO: "centroid", [5, 10, 15]
 ECHO: "volume", 6000
 ECHO: "overhang", 0
+ECHO: "count", 1
+ECHO: "length", 240, "angle", 90, "convex", true
+ECHO: "bbox", [0, 0, 0], [10, 20, 30]
+ECHO: "concave count", 1
+ECHO: "concave length", 10, "convex", false
+ECHO: "chamfer at 50", 1
+ECHO: "chamfer at 50, length", 62.8066
+ECHO: "chamfer at 40", 3
+ECHO: "sphere", []

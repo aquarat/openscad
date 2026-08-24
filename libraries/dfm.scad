@@ -12,11 +12,11 @@
 // children unchanged — so dropping a check into a design never alters geometry.
 //
 // A note on scope: these checks are as strong as the introspection primitives
-// allow today. Overhang and bounding-box/build-volume fit are exact-ish and
-// cheap. A true "minimum wall thickness anywhere" test needs a signed-distance
-// field over the mesh, which the engine does not yet expose — dfm_min_wall()
-// below is a deliberately conservative bounding-box proxy and is documented as
-// such, not a substitute for a real thickness analysis.
+// allow today. Overhang, sharp edges and bounding-box/build-volume fit are
+// exact-ish and cheap. A true "minimum wall thickness anywhere" test needs a
+// signed-distance field over the mesh, which the engine does not yet expose —
+// dfm_min_wall() below is a deliberately conservative bounding-box proxy and is
+// documented as such, not a substitute for a real thickness analysis.
 
 // ---- Individual checks ------------------------------------------------------
 
@@ -73,6 +73,65 @@ module dfm_min_wall(min_wall = 1.0, report = false) {
   children();
 }
 
+// ---- Sharp edges ------------------------------------------------------------
+// Two different defects, and they want opposite fixes, so they get separate
+// checks rather than one budget over both:
+//
+//   convex   an outside corner. At 90 degrees it is a hard line under the
+//            fingers and the first thing to chip. Fix with a chamfer or a
+//            round-over (edges.scad: edge_extrude, seam_band).
+//   concave  an inside corner. Its stress concentration factor rises without
+//            bound as the radius goes to zero, and on an FDM part it is where a
+//            boss shears off the floor it stands on. Fix with a cove
+//            (edges.scad: edge_cove, boss).
+//
+// Both are budgets in MILLIMETRES OF EDGE, not counts: one long ring round a
+// rim matters more than a dozen short runs, and a count cannot tell them apart.
+
+// Total length of sharp edge of one kind. `kind` is "any", "convex" or
+// "concave"; `angle` is how far the surface may turn across an edge before it
+// counts, in degrees. 50 is the useful default — just above 45, so a 45-degree
+// chamfer does not report itself as the defect it fixes.
+// (OpenSCAD has no sum(); `use <>` imports every function, so the helper is
+// underscore-prefixed rather than called something as grabbable as `add`.)
+function _dfm_sum(v, i = 0) = i >= len(v) ? 0 : v[i] + _dfm_sum(v, i + 1);
+function dfm_sharp_length(edges) =
+  _dfm_sum([for (e = edges) e[0]]);
+
+module dfm_assert_sharp(max_convex_mm = 0, max_concave_mm = 0, angle = 50,
+                        report = false) {
+  cx = sharp_edges(angle = angle, kind = "convex");
+  cc = sharp_edges(angle = angle, kind = "concave");
+  lx = dfm_sharp_length(cx);
+  lc = dfm_sharp_length(cc);
+  if (report)
+    echo(dfm_sharp_convex_mm = lx, dfm_sharp_concave_mm = lc,
+         dfm_sharp_angle = angle);
+  assert(lx <= max_convex_mm + 1e-6,
+         str("DFM: ", lx, " mm of convex edge sharper than ", angle,
+             " deg (budget ", max_convex_mm, "). Worst feature: ", cx[0][0],
+             " mm at ", cx[0][6], ". Chamfer or round it — see edges.scad."));
+  assert(lc <= max_concave_mm + 1e-6,
+         str("DFM: ", lc, " mm of concave edge sharper than ", angle,
+             " deg (budget ", max_concave_mm, "). Worst feature: ", cc[0][0],
+             " mm at ", cc[0][6], ". Fillet it — see edge_cove() in edges.scad."));
+  children();
+}
+
+// Echo the sharp-edge features, worst first, without asserting anything. This
+// is the one to reach for first: it names WHERE the edges are, which is what
+// you need before you can decide what to do about them.
+module dfm_sharp_report(angle = 50, kind = "any", limit = 10) {
+  e = sharp_edges(angle = angle, kind = kind);
+  echo(str("DFM sharp-edge report: ", len(e), " features, ",
+           dfm_sharp_length(e), " mm total, at >= ", angle, " deg"));
+  for (i = [0 : min(limit, len(e)) - 1])
+    echo(str("  ", e[i][3] ? "CONVEX " : "concave", " ", e[i][0], " mm  ",
+             e[i][1], " deg  centre ", e[i][6], "  bbox ", e[i][4], "..", e[i][5]));
+  children();
+}
+
+
 // ---- Convenience report + combined check ------------------------------------
 
 // Echo a one-shot DFM report for the children (no assertions).
@@ -82,7 +141,9 @@ module dfm_report() {
        dfm_size = bb[1] - bb[0],
        dfm_centroid = centroid(),
        dfm_volume_mm3 = volume(),
-       dfm_max_overhang_deg = overhang());
+       dfm_max_overhang_deg = overhang(),
+       dfm_sharp_convex_mm = dfm_sharp_length(sharp_edges(angle = 50, kind = "convex")),
+       dfm_sharp_concave_mm = dfm_sharp_length(sharp_edges(angle = 50, kind = "concave")));
   children();
 }
 

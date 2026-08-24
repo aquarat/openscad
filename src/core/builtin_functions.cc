@@ -25,11 +25,13 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <boost/format.hpp>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <limits>
+#include <map>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -1419,6 +1421,301 @@ Value builtin_overhang(const std::shared_ptr<const Context>& context, const Func
   return {max_angle};
 }
 
+// sharp_edges(): find the sharp edges of the children's mesh, grouped into
+// features.
+//
+// Motivation: overhang() answers "will this print?", but says nothing about
+// "will this feel right in the hand, and will it survive?". A 90-degree convex
+// edge is a UX defect (it is what you notice when you grip a case) and a
+// 90-degree concave edge is a stress riser (it is where a boss snaps off its
+// floor). Neither is visible to a parameter assert(), because both are produced
+// by the BOOLEAN, not by any single number in the model.
+//
+// Method: weld the triangulated mesh by position, find every manifold edge
+// (shared by exactly two triangles), and measure the angle between the two face
+// normals. That angle is 0 for a flat surface and 90 for a square corner --
+// i.e. it is the amount the surface TURNS across the edge, which is exactly the
+// quantity a chamfer or fillet is there to reduce. An edge is convex when the
+// far triangle's apex lies behind the near triangle's plane, concave otherwise.
+//
+// Raw edges are useless to a human -- a tessellated box rim is hundreds of them
+// -- so connected runs of edges of the same convexity are unioned into a single
+// FEATURE, and one record per feature is returned. That turns "4068 sharp edges"
+// into "a 501 mm convex ring at z = 18.3", which names a thing you can go and
+// fix.
+//
+// Each record is a plain vector (not an object: object member access is behind
+// a separate experimental feature, and bbox() already sets the precedent that
+// these functions return positional data):
+//
+//   [ length, angle, angle_max, convex, [min], [max], [centre] ]
+//       0       1        2         3      4      5        6
+//
+//   length     total mm of edge in the feature
+//   angle      length-weighted mean turn angle, degrees
+//   angle_max  worst turn angle in the feature, degrees
+//   convex     true for an outside corner, false for an inside corner
+//   min/max    bounding box of the feature
+//   centre     length-weighted mean of the edge midpoints
+//
+// Records are sorted longest-first, so record 0 is the biggest offender.
+// See libraries/edges.scad for the modules that FIX what this finds.
+//
+// `min_face` is what keeps this honest. Chamfers and coves are usually built as
+// a stack of hulled slices, and that construction leaves sub-micron slivers of
+// surface behind at the ends of the stack. Those slivers meet their neighbours
+// at 90 degrees, so a naive dihedral scan reports the FIX as a fresh defect.
+// An edge only means anything if there is real surface either side of it, so an
+// edge whose neighbouring triangle is thinner than `min_face` (measured
+// perpendicular to the edge, 2*area/length) is treated as mesh construction
+// noise and skipped. The default, 0.05 mm, is a quarter of a typical FDM layer:
+// well below anything a printer can render or a finger can feel, and far above
+// float32 STL round-off.
+//
+// The guard's one cost: a flat cap triangulated as a FAN has two sliver
+// triangles either side of the fan's apex, and they are coplanar with the rest
+// of the cap, so the surface really is wide there even though those two
+// triangles are not. Their two rim edges get skipped, which nicks a few percent
+// off a circular rim's reported length and can split it into two features. The
+// alternative -- no guard -- makes every chamfer and fillet report itself as a
+// fresh defect, which is very much worse.
+namespace {
+
+// A welded vertex key: the position quantised to SHARP_WELD_Q mm. Meshes coming
+// back from the Manifold backend are already indexed, but STL-ish round trips
+// and coplanar booleans can leave two indices at the same point; welding makes
+// the edge match by POSITION so a feature does not silently split in two.
+constexpr double SHARP_WELD_Q = 1e-5;
+
+struct SharpEdgeRec {
+  size_t a, b;        // welded vertex indices, a < b
+  double length;
+  double angle;       // degrees the surface turns across the edge
+  bool convex;
+};
+
+// Disjoint-set over (welded vertex, convexity) slots, used to union runs of
+// sharp edges into features. Convexity is part of the key so a convex rim and
+// the concave groove it sits next to never merge into one meaningless blob.
+class SharpUnionFind {
+public:
+  explicit SharpUnionFind(size_t n) : parent_(n) {
+    for (size_t i = 0; i < n; ++i) parent_[i] = i;
+  }
+  size_t find(size_t x) {
+    while (parent_[x] != x) x = parent_[x] = parent_[parent_[x]];
+    return x;
+  }
+  void unite(size_t x, size_t y) {
+    const size_t rx = find(x), ry = find(y);
+    if (rx != ry) parent_[rx] = ry;
+  }
+private:
+  std::vector<size_t> parent_;
+};
+
+struct SharpFeature {
+  double length = 0.0;
+  double angle_weighted = 0.0;   // sum(angle * length), divided out at the end
+  double angle_max = 0.0;
+  bool convex = false;
+  Vector3d lo = Vector3d::Constant(std::numeric_limits<double>::infinity());
+  Vector3d hi = Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  Vector3d centre_weighted = Vector3d::Zero();  // sum(midpoint * length)
+};
+
+}  // namespace
+
+Value builtin_sharp_edges(const std::shared_ptr<const Context>& context, const FunctionCall *call)
+{
+  Arguments arguments{call->arguments, context};
+  const Location& loc = call->location();
+  auto *session = arguments.session();
+
+  double min_angle = 30.0;
+  double min_length = 0.5;
+  double min_face = 0.05;
+  std::string kind = "any";
+  bool has_child = false;
+  size_t child_index = 0;
+  {
+    Parameters parameters = Parameters::parse(std::move(arguments), loc, {},
+                                              {"angle", "kind", "min_length",
+                                               "min_face", "child"});
+    parameters.set_caller("sharp_edges");
+    min_angle = parameters.get("angle", 30.0);
+    min_length = parameters.get("min_length", 0.5);
+    min_face = parameters.get("min_face", 0.05);
+    kind = parameters.get("kind", std::string("any"));
+    if (kind != "any" && kind != "convex" && kind != "concave") {
+      throw EvaluationException(STR(boost::format(
+        "sharp_edges(): kind must be \"any\", \"convex\" or \"concave\", got \"%1%\".") % kind));
+    }
+    const auto child = parameters.lookup("child");
+    if (child && !child->isUndefined()) {
+      if (child->type() != Value::Type::NUMBER) {
+        throw EvaluationException(STR(boost::format(
+          "sharp_edges(): child must be a child index (number).")));
+      }
+      if (!metric_child_index("sharp_edges", context, *child, loc, child_index)) {
+        return Value::undefined.clone();
+      }
+      has_child = true;
+    }
+  }
+
+  std::vector<size_t> indices;
+  const std::vector<size_t> *idxptr = nullptr;
+  if (has_child) {
+    indices.push_back(child_index);
+    idxptr = &indices;
+  }
+
+  auto geom = require_children_geometry("sharp_edges", context, idxptr);
+  auto ps = geometry_as_triangle_polyset(geom);
+  if (!ps) {
+    // No 3D solid (empty, or purely 2D): no edges to measure. An empty list is
+    // the honest answer and keeps `for (e = sharp_edges())` working.
+    VectorType empty(session);
+    return std::move(empty);
+  }
+
+  // ---- weld vertices by quantised position ---------------------------------
+  std::map<std::array<int64_t, 3>, size_t> weld_map;
+  std::vector<size_t> weld_of(ps->vertices.size());
+  std::vector<Vector3d> wverts;
+  wverts.reserve(ps->vertices.size());
+  for (size_t i = 0; i < ps->vertices.size(); ++i) {
+    const Vector3d& v = ps->vertices[i];
+    const std::array<int64_t, 3> key{
+      static_cast<int64_t>(std::llround(v.x() / SHARP_WELD_Q)),
+      static_cast<int64_t>(std::llround(v.y() / SHARP_WELD_Q)),
+      static_cast<int64_t>(std::llround(v.z() / SHARP_WELD_Q))};
+    auto it = weld_map.find(key);
+    if (it == weld_map.end()) {
+      weld_map.emplace(key, wverts.size());
+      weld_of[i] = wverts.size();
+      wverts.push_back(v);
+    } else {
+      weld_of[i] = it->second;
+    }
+  }
+
+  // ---- collect half-edges, each tagged with its face and opposite vertex ----
+  struct HalfEdge { size_t a, b, face, opp; };
+  std::vector<HalfEdge> halves;
+  std::vector<Vector3d> normals(ps->indices.size(), Vector3d::Zero());
+  // Twice the triangle area, kept so an edge can ask how WIDE its neighbouring
+  // faces are: width perpendicular to the edge = 2*area / edge length.
+  std::vector<double> area2(ps->indices.size(), 0.0);
+  halves.reserve(ps->indices.size() * 3);
+  for (size_t f = 0; f < ps->indices.size(); ++f) {
+    const auto& face = ps->indices[f];
+    if (face.size() < 3) continue;
+    const size_t i0 = weld_of[face[0]], i1 = weld_of[face[1]], i2 = weld_of[face[2]];
+    const Vector3d n = (wverts[i1] - wverts[i0]).cross(wverts[i2] - wverts[i0]);
+    const double len = n.norm();
+    if (len < 1e-12) continue;  // degenerate triangle: no meaningful normal
+    normals[f] = n / len;
+    area2[f] = len;
+    const size_t tri[3] = {i0, i1, i2};
+    for (int k = 0; k < 3; ++k) {
+      size_t a = tri[k], b = tri[(k + 1) % 3];
+      const size_t opp = tri[(k + 2) % 3];
+      if (a == b) continue;  // collapsed edge
+      if (a > b) std::swap(a, b);
+      halves.push_back({a, b, f, opp});
+    }
+  }
+  std::sort(halves.begin(), halves.end(), [](const HalfEdge& x, const HalfEdge& y) {
+    return x.a != y.a ? x.a < y.a : x.b < y.b;
+  });
+
+  // ---- measure every manifold edge -----------------------------------------
+  std::vector<SharpEdgeRec> sharp;
+  for (size_t i = 0; i < halves.size(); ) {
+    size_t j = i + 1;
+    while (j < halves.size() && halves[j].a == halves[i].a && halves[j].b == halves[i].b) ++j;
+    const size_t run = j - i;
+    i = j;
+    // run == 1 is a boundary edge and run > 2 is non-manifold; neither has a
+    // single dihedral angle. Both are real defects, but they belong to the
+    // manifoldness check, not here.
+    if (run != 2) continue;
+    const HalfEdge& h1 = halves[j - 2];
+    const HalfEdge& h2 = halves[j - 1];
+    const Vector3d& n1 = normals[h1.face];
+    const Vector3d& n2 = normals[h2.face];
+    if (n1.isZero() || n2.isZero()) continue;
+    const double dot = std::max(-1.0, std::min(1.0, n1.dot(n2)));
+    const double angle = acos_degrees(dot);
+    if (angle < min_angle) continue;
+    // Convex when the far triangle's apex sits BEHIND the near triangle's
+    // plane -- material folds away from the outward normal, i.e. an outside
+    // corner. Concave (an inside corner) when it sits in front.
+    const bool convex = n1.dot(wverts[h2.opp] - wverts[h1.a]) < 0.0;
+    if (kind == "convex" && !convex) continue;
+    if (kind == "concave" && convex) continue;
+    const double elen = (wverts[h1.b] - wverts[h1.a]).norm();
+    if (elen <= 0.0) continue;
+    // Sliver guard: an edge whose neighbouring surface is narrower than
+    // min_face is construction noise, not an edge anyone can feel.
+    if (min_face > 0.0 &&
+        (area2[h1.face] / elen < min_face || area2[h2.face] / elen < min_face)) continue;
+    sharp.push_back({h1.a, h1.b, elen, angle, convex});
+  }
+
+  // ---- union connected runs of the same convexity into features ------------
+  SharpUnionFind uf(wverts.size() * 2);
+  auto slot = [](size_t v, bool convex) { return v * 2 + (convex ? 1u : 0u); };
+  for (const auto& e : sharp) uf.unite(slot(e.a, e.convex), slot(e.b, e.convex));
+
+  std::map<size_t, SharpFeature> features;
+  for (const auto& e : sharp) {
+    SharpFeature& fe = features[uf.find(slot(e.a, e.convex))];
+    fe.convex = e.convex;
+    fe.length += e.length;
+    fe.angle_weighted += e.angle * e.length;
+    fe.angle_max = std::max(fe.angle_max, e.angle);
+    const Vector3d& pa = wverts[e.a];
+    const Vector3d& pb = wverts[e.b];
+    fe.lo = fe.lo.cwiseMin(pa).cwiseMin(pb);
+    fe.hi = fe.hi.cwiseMax(pa).cwiseMax(pb);
+    fe.centre_weighted += (0.5 * (pa + pb)) * e.length;
+  }
+
+  std::vector<const SharpFeature *> ordered;
+  ordered.reserve(features.size());
+  for (const auto& kv : features) {
+    if (kv.second.length >= min_length) ordered.push_back(&kv.second);
+  }
+  std::sort(ordered.begin(), ordered.end(),
+            [](const SharpFeature *x, const SharpFeature *y) { return x->length > y->length; });
+
+  // ---- emit ----------------------------------------------------------------
+  VectorType result(session);
+  result.reserve(ordered.size());
+  for (const SharpFeature *fe : ordered) {
+    const double inv = (fe->length > 0.0) ? 1.0 / fe->length : 0.0;
+    const Vector3d centre = fe->centre_weighted * inv;
+    VectorType lo(session), hi(session), ctr(session);
+    for (int i = 0; i < 3; ++i) lo.emplace_back(fe->lo[i]);
+    for (int i = 0; i < 3; ++i) hi.emplace_back(fe->hi[i]);
+    for (int i = 0; i < 3; ++i) ctr.emplace_back(centre[i]);
+    VectorType rec(session);
+    rec.reserve(7);
+    rec.emplace_back(fe->length);
+    rec.emplace_back(fe->angle_weighted * inv);
+    rec.emplace_back(fe->angle_max);
+    rec.emplace_back(fe->convex);
+    rec.emplace_back(std::move(lo));
+    rec.emplace_back(std::move(hi));
+    rec.emplace_back(std::move(ctr));
+    result.emplace_back(std::move(rec));
+  }
+  return std::move(result);
+}
+
 Value builtin_is_undef(const std::shared_ptr<const Context>& context, const FunctionCall *call)
 {
   if (call->arguments.size() != 1) {
@@ -1751,5 +2048,14 @@ void register_builtin_functions()
                  {
                    "overhang() -> worst downward-facing angle from vertical (degrees)",
                    "overhang(i) -> worst downward-facing angle of child index i",
+                 });
+
+  Builtins::init("sharp_edges",
+                 new BuiltinFunction(&builtin_sharp_edges, &Feature::ExperimentalGeometryMetrics),
+                 {
+                   "sharp_edges([angle], [kind], [min_length], [min_face], [child]) -> list of "
+                   "sharp-edge "
+                   "features, longest first; each is "
+                   "[length, angle, angle_max, convex, [min], [max], [centre]]",
                  });
 }
