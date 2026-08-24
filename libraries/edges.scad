@@ -180,12 +180,16 @@ module edge_loft(ladder) { _edge_ladder(ladder) children(); }
 module _edge_ladder(raw, eps = 0.001, sink_first = false) {
   ladder = _edge_dedupe(raw);
   n = len(ladder);
-  // Every slice is extruded UP from its rung except the last, which is extruded
-  // DOWN onto it. Otherwise the topmost slice adds eps to the solid's height,
-  // and a part whose top face has to be exact — a bezel that must sit flat on
-  // the bed once it is flipped for printing — comes out a micron proud and
-  // fails its own bed check.
-  function zo(i) = (i == n - 1) ? -eps : 0;
+  // Is the segment ABOVE rung i a plain prism (no change of offset)?
+  function prism_above(i) =
+    i < n - 1 && abs(ladder[i][1] - ladder[i + 1][1]) < 1e-9;
+  // Which way a frustum's slice is extruded off its rung. Down at the very top,
+  // so the solid's height is exact; down where a PRISM starts, so the frustum
+  // ends on the prism's base plane instead of duplicating its first eps; up
+  // everywhere else, so consecutive frusta overlap and the union is watertight.
+  function slice_z(i) =
+    ladder[i][0] - (((i == n - 1) || prism_above(i) || (i == 0 && sink_first))
+                    ? eps : 0);
   if (n < 2) {
     _edge_slice(ladder[0][0], ladder[0][1], eps) children();
   } else {
@@ -198,21 +202,17 @@ module _edge_ladder(raw, eps = 0.001, sink_first = false) {
       //   differently from the frustum stacked on it, and the T-junctions along
       //   the join export as edges shared by four triangles.
       //
-      //   give the prism the usual eps overshoot and its end face lands exactly
-      //   coplanar with the end face of the neighbouring frustum's eps slab --
-      //   two coincident faces, same result. A frustum slab sitting INSIDE a
-      //   prism is harmless; two slabs ending on the same plane are not.
-      //
-      // So prisms are exact and frusta overlap them, never the other way round.
-      if (abs(ladder[i][1] - ladder[i + 1][1]) < 1e-9)
-        let (pz = (i == 0 && sink_first) ? ladder[0][0] - eps : ladder[i][0])
-          _edge_slice(pz, ladder[i][1], ladder[i + 1][0] - pz) children();
+      //   let a prism and a frustum OVERLAP and their eps slabs coincide
+      //   exactly — same profile, same z — which is two copies of the same
+      //   solid, and the exporter duplicates the faces. Prisms are exact and
+      //   frusta stop on their planes; nothing overlaps a prism.
+      if (prism_above(i))
+        _edge_slice(ladder[i][0], ladder[i][1],
+                    ladder[i + 1][0] - ladder[i][0]) children();
       else
         hull() {
-          _edge_slice(ladder[i][0] - ((i == 0 && sink_first) ? eps : 0),
-                      ladder[i][1], eps) children();
-          _edge_slice(ladder[i + 1][0] + ((i + 1 == n - 1) ? -eps : 0),
-                      ladder[i + 1][1], eps) children();
+          _edge_slice(slice_z(i),     ladder[i][1],     eps) children();
+          _edge_slice(slice_z(i + 1), ladder[i + 1][1], eps) children();
         }
   }
 }
